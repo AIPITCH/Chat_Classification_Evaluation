@@ -76,6 +76,15 @@ def channel_output_dir(sample_channel: Any) -> str:
     return os.path.join(RESULTS_DIR, channel_id(sample_channel))
 
 
+def set_results_dir(folder: str | None) -> None:
+    """
+    Override the base folder containing per-channel result directories.
+    """
+    global RESULTS_DIR
+    if folder:
+        RESULTS_DIR = os.path.abspath(folder)
+
+
 def load_config(path: str) -> dict[str, Any]:
     """
     Load YAML config if present.
@@ -686,6 +695,11 @@ def main() -> int:
         help="classification.md output path",
     )
     parser.add_argument(
+        "--folder",
+        default=None,
+        help="Base folder for per-channel directories, default result/",
+    )
+    parser.add_argument(
         "--config",
         default=os.path.join(REPO_DIR, "config.yaml"),
         help="config.yaml path",
@@ -712,6 +726,7 @@ def main() -> int:
     )
     parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout")
     args = parser.parse_args()
+    set_results_dir(args.folder)
 
     config = load_config(args.config)
     try:

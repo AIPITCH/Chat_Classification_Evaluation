@@ -13,7 +13,7 @@ import sys
 
 from evaluate import channel_output_dir, configure_log_level, discover_sample_paths
 from evaluate import load_config, load_json, logger
-from evaluate import sample_path_for_id
+from evaluate import sample_path_for_id, set_results_dir
 from challenge import collect_model_tags, keyword_matches, read_existing_validation
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -432,6 +432,11 @@ def main() -> int:
         help="results.md output path",
     )
     parser.add_argument(
+        "--folder",
+        default=None,
+        help="Base folder for per-channel directories, default result/",
+    )
+    parser.add_argument(
         "--validation-svg",
         default=None,
         help="validation SVG path",
@@ -462,6 +467,7 @@ def main() -> int:
         help="config.yaml path",
     )
     args = parser.parse_args()
+    set_results_dir(args.folder)
 
     config = load_config(args.config)
     try:

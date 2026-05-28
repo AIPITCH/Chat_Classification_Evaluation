@@ -1,6 +1,7 @@
 sample_channel.json
 query.md
 result/
+aipitch/
 log/
 __pycache__/
 *.pyc

@@ -20,6 +20,7 @@ from evaluate import get_classifier_api_base, logger
 from evaluate import load_json
 from evaluate import get_ollama_api_base, load_config, load_ollama_model
 from evaluate import read_existing_results, sample_path_for_id
+from evaluate import set_results_dir
 from evaluate import unload_ollama_model, warmup_model
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -600,6 +601,11 @@ def main() -> int:
         help="validation.md output path",
     )
     parser.add_argument(
+        "--folder",
+        default=None,
+        help="Base folder for per-channel directories, default result/",
+    )
+    parser.add_argument(
         "--validation-svg",
         default=None,
         help="validation SVG output path",
@@ -641,6 +647,7 @@ def main() -> int:
     )
     parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout")
     args = parser.parse_args()
+    set_results_dir(args.folder)
 
     config = load_config(args.config)
     try:

@@ -13,12 +13,11 @@ import sys
 import requests
 import yaml
 
-from evaluate import configure_log_level, logger
+from evaluate import configure_log_level, logger, set_results_dir
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(THIS_DIR)
 EVALUATE_DIR = THIS_DIR
-RESULTS_DIR = os.path.join(REPO_DIR, "result")
 CONFIG_PATH = os.path.join(REPO_DIR, "config.yaml")
 
 
@@ -88,6 +87,8 @@ def output_path(channel_id: str) -> str:
     """
     Return output JSON path for a channel id.
     """
+    from evaluate import RESULTS_DIR
+
     return os.path.join(RESULTS_DIR, channel_id, "sample_channel.json")
 
 
@@ -293,6 +294,11 @@ def main() -> int:
         default=CONFIG_PATH,
         help="config.yaml path",
     )
+    parser.add_argument(
+        "--folder",
+        default=None,
+        help="Base folder for per-channel directories, default result/",
+    )
     parser.add_argument("--timeout", type=int, default=None, help="HTTP timeout")
     parser.add_argument(
         "--random",
@@ -306,6 +312,7 @@ def main() -> int:
         help="Keep message id and posted_utc fields",
     )
     args = parser.parse_args()
+    set_results_dir(args.folder)
 
     config = load_config(args.config)
     try:

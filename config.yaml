@@ -1,0 +1,17 @@
+log: debug
+flask:
+  host: 127.0.0.1
+  port: 5050
+channel_service:
+  api_base: http://127.0.0.1:6001
+  timeout: 300
+ollama:
+  api_base: http://localhost:11434
+  model: gpt-oss:120b
+  timeout: 300
+  temperature: 0.1
+  blacklist:
+    - glm-ocr:latest
+    - laguna-xs.2:bf16
+    - qwen3-vl:30b
+    - glm-4.7-flash:bf16 

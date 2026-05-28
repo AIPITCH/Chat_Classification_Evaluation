@@ -1,0 +1,13 @@
+sample_channel.json
+query.md
+result/
+log/
+__pycache__/
+*.pyc
+.venv/
+*.svg
+evaluation.md
+evaluation_results.md
+performance.md
+bef_reboot_evaluation.md
+results_open/

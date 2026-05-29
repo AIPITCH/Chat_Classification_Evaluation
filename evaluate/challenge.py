@@ -37,16 +37,26 @@ def ensure_parent_dir(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
-def collect_model_tags(evaluation_path: str) -> tuple[dict[str, set[str]], list[str]]:
+def collect_model_tags(
+    evaluation_path: str,
+    include_failed: bool = False,
+) -> tuple[dict[str, set[str]], list[str]]:
     """
     Read classification.md and return per-model tags plus sorted tag union.
     """
     model_tags: dict[str, set[str]] = {}
-    for model, tags_csv, _, _ in read_existing_results(evaluation_path):
-        tags = {tag.strip() for tag in tags_csv.split(",") if tag.strip()}
-        if tags:
+    rows = read_existing_results(evaluation_path, strict=not include_failed)
+    for model, tags_csv, _, _ in rows:
+        tags: set[str] = set()
+        if not tags_csv.startswith("ERROR:") and "," in tags_csv:
+            tags = {tag.strip() for tag in tags_csv.split(",") if tag.strip()}
+        if tags or include_failed:
             model_tags[model] = tags
-    all_tags = sorted(set().union(*model_tags.values()), key=str.casefold)
+    all_tags = (
+        sorted(set().union(*model_tags.values()), key=str.casefold)
+        if model_tags
+        else []
+    )
     return model_tags, all_tags
 
 
@@ -325,8 +335,15 @@ def write_graphs(
     validation_by_model = {
         model: keyword_matches(result) for model, result, _, _ in validation_results
     }
+    failed_validation_models = {
+        model
+        for model, result, _, _ in validation_results
+        if isinstance(result, dict) and "error" in result
+    }
 
     def validation_color(model: str, tag: str) -> str:
+        if not model_tags.get(model) or model in failed_validation_models:
+            return "#d9d9d9"
         matches = validation_by_model.get(model, {})
         key = tag.casefold()
         if key not in matches:
@@ -334,6 +351,8 @@ def write_graphs(
         return "#2ca25f" if matches[key] else "#de2d26"
 
     def detection_color(model: str, tag: str) -> str:
+        if not model_tags.get(model):
+            return "#d9d9d9"
         return "#000000" if tag in model_tags.get(model, set()) else "#ffffff"
 
     write_svg_matrix(validation_path, "validation", models, tags, validation_color)
@@ -382,7 +401,7 @@ def prepare_channel_validations(
                 or paths["processing_time_validation_svg"]
             )
 
-        model_tags, all_tags = collect_model_tags(paths["input"])
+        model_tags, all_tags = collect_model_tags(paths["input"], include_failed=True)
         if not model_tags:
             logger.warning("No valid model tags found in %s", paths["input"])
             continue
@@ -399,9 +418,29 @@ def prepare_channel_validations(
             "processing time",
         )
         results = [] if args.force else read_existing_validation(paths["output"])
+        retry_models = None
         if args.retry_model:
             results = [result for result in results if result[0] != args.retry_model]
+            retry_models = {args.retry_model}
             write_markdown(paths["output"], results)
+        elif args.retry_error:
+            retry_models = {
+                model
+                for model, result, _, _ in results
+                if model in model_tags and model_tags.get(model) and "error" in result
+            }
+            results = [
+                result
+                for result in results
+                if result[0] in model_tags and result[0] not in retry_models
+            ]
+            if retry_models:
+                write_markdown(paths["output"], results)
+            if not retry_models:
+                logger.info(
+                    "No failed validation to retry in %s",
+                    channel_id_for_log(sample_channel),
+                )
         else:
             results = [result for result in results if result[0] in model_tags]
         completed = {model for model, _, _, _ in results}
@@ -418,6 +457,7 @@ def prepare_channel_validations(
                 "model_tags": model_tags,
                 "all_tags": all_tags,
                 "results": results,
+                "retry_models": retry_models,
             }
         )
     return channels
@@ -452,7 +492,12 @@ def validate_channels(
         1
         for model in all_models
         for channel in channels
-        if model in channel["model_tags"]
+        if (
+            channel.get("retry_models") is None
+            or model in channel.get("retry_models", set())
+        )
+        and model in channel["model_tags"]
+        and channel["model_tags"].get(model)
         and model not in {result[0] for result in channel["results"]}
     )
     completed_queries = 0
@@ -465,7 +510,12 @@ def validate_channels(
         pending = [
             channel
             for channel in channels
-            if model in channel["model_tags"]
+            if (
+                channel.get("retry_models") is None
+                or model in channel.get("retry_models", set())
+            )
+            and model in channel["model_tags"]
+            and channel["model_tags"].get(model)
             and model not in {result[0] for result in channel["results"]}
         ]
         if not pending:
@@ -645,6 +695,11 @@ def main() -> int:
         default=None,
         help="Flush this model from validation.md and rerun only it",
     )
+    parser.add_argument(
+        "--retry-error",
+        action="store_true",
+        help="Flush failed validation entries and rerun only those models",
+    )
     parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout")
     args = parser.parse_args()
     set_results_dir(args.folder)
@@ -660,6 +715,12 @@ def main() -> int:
 
     if args.doall and args.do_id:
         logger.error("Use either --do or --doall")
+        return 1
+    if args.retry_model and args.retry_error:
+        logger.error("Use either --retry-model or --retry-error")
+        return 1
+    if args.force and args.retry_error:
+        logger.error("Use either --force or --retry-error")
         return 1
     custom_outputs = [
         args.input,

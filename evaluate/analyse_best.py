@@ -13,6 +13,7 @@ import sys
 
 from evaluate import channel_output_dir, configure_log_level, discover_sample_paths
 from evaluate import load_config, load_json, logger
+from evaluate import read_existing_results
 from evaluate import sample_path_for_id, set_results_dir
 from challenge import collect_model_tags, keyword_matches, read_existing_validation
 
@@ -32,6 +33,11 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
     """
     Compute tag and model performance from evaluation reports.
     """
+    all_evaluation_results = read_existing_results(evaluation_path, strict=False)
+    all_evaluation_models = sorted(
+        {model for model, _, _, _ in all_evaluation_results},
+        key=str.casefold,
+    )
     model_tags, all_tags = collect_model_tags(evaluation_path)
     validation_results = [
         result
@@ -87,7 +93,8 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
 
     model_rows = []
     contradictory_rows = []
-    for model in validated_models:
+    for model in all_evaluation_models:
+        has_error = model not in model_tags or model not in validation_by_model
         proposed_tags = sorted(model_tags.get(model, set()), key=str.casefold)
         matches = validation_by_model.get(model, {})
         validated_tags = [
@@ -107,8 +114,9 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
                 "validated_percent": round(
                     (validated_count / proposed_count) * 100, 2
                 )
-                if proposed_count
+                if proposed_count and not has_error
                 else 0.0,
+                "has_error": has_error,
                 "proposed_tags": proposed_tags,
                 "validated_tags": validated_tags,
             }
@@ -119,8 +127,11 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
                 "tag_refuted": refuted_count,
                 "total_tag": proposed_count,
                 "refuted_percent": round((refuted_count / proposed_count) * 100, 2)
-                if proposed_count
+                if proposed_count and not has_error
+                else 100.0
+                if has_error
                 else 0.0,
+                "has_error": has_error,
                 "refuted_tags": refuted_tags,
             }
         )
@@ -129,13 +140,14 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
         row["tag"] for row in tag_rows if row["validated_percent_of_responses"] >= 75
     }
     tagging_rows = []
-    for model in sorted(model_tags, key=str.casefold):
+    for model in all_evaluation_models:
+        has_error = model not in model_tags or model not in validation_by_model
         proposed_approved = sorted(
             model_tags.get(model, set()).intersection(approved_tags),
             key=str.casefold,
         )
         total_approved = len(approved_tags)
-        found_count = len(proposed_approved)
+        found_count = 0 if has_error else len(proposed_approved)
         tagging_rows.append(
             {
                 "model": model,
@@ -144,7 +156,8 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
                 "found_percent": round((found_count / total_approved) * 100, 2)
                 if total_approved
                 else 0.0,
-                "found_tags": proposed_approved,
+                "has_error": has_error,
+                "found_tags": [] if has_error else proposed_approved,
                 "missing_tags": sorted(
                     approved_tags.difference(proposed_approved),
                     key=str.casefold,
@@ -155,6 +168,7 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
     return {
         "summary": {
             "responses_collected": total_responses,
+            "models_total": len(all_evaluation_models),
             "models_with_tags": len(model_tags),
             "models_with_validation": len(validation_by_model),
             "unique_tags": len(all_tags),
@@ -212,6 +226,359 @@ def read_query_tokens(path: str) -> int | None:
     return None
 
 
+def metric_stats(values: list[float]) -> dict[str, float | int]:
+    """
+    Return count/min/max/mean for one model metric.
+    """
+    if not values:
+        return {"count": 0, "sum": 0.0, "min": 0.0, "max": 0.0, "mean": 0.0}
+    return {
+        "count": len(values),
+        "sum": round(sum(values), 2),
+        "min": round(min(values), 2),
+        "max": round(max(values), 2),
+        "mean": round(sum(values) / len(values), 2),
+    }
+
+
+def aggregate_model_metric(
+    reports: list[dict],
+    section: str,
+    value_key: str,
+) -> list[dict[str, float | int | str]]:
+    """
+    Aggregate one per-report model percentage section.
+    """
+    values_by_model: dict[str, list[float]] = {}
+    errors_by_model: dict[str, int] = {}
+    for report in reports:
+        for row in report.get(section, []):
+            model = row.get("model")
+            value = row.get(value_key)
+            if model is None or value is None:
+                continue
+            values_by_model.setdefault(str(model), []).append(float(value))
+            if row.get("has_error"):
+                errors_by_model[str(model)] = errors_by_model.get(str(model), 0) + 1
+
+    rows = []
+    for model, values in values_by_model.items():
+        row = {"model": model}
+        row.update(metric_stats(values))
+        row["errors"] = errors_by_model.get(model, 0)
+        rows.append(row)
+    return sorted(
+        rows,
+        key=lambda row: (
+            float(row["mean"]),
+            int(row["count"]),
+            str(row["model"]).casefold(),
+        ),
+        reverse=True,
+    )
+
+
+def aggregate_elapsed_metric(
+    report_paths: list[str],
+    reader,
+) -> list[dict[str, float | int | str]]:
+    """
+    Aggregate elapsed_second_request values from classification/validation reports.
+    """
+    values_by_model: dict[str, list[float]] = {}
+    for path in report_paths:
+        for model, _, elapsed, _ in reader(path):
+            values_by_model.setdefault(str(model), []).append(float(elapsed))
+
+    rows = []
+    for model, values in values_by_model.items():
+        row = {"model": model}
+        row.update(metric_stats(values))
+        rows.append(row)
+    return sorted(
+        rows,
+        key=lambda row: (
+            float(row["mean"]),
+            int(row["count"]),
+            str(row["model"]).casefold(),
+        ),
+    )
+
+
+def read_detection_times(path: str) -> list[tuple[str, str, float, str]]:
+    """
+    Read detection timings and skip failed model outputs.
+    """
+    return [
+        row
+        for row in read_existing_results(path, strict=False)
+        if not str(row[1]).startswith("ERROR:")
+    ]
+
+
+def read_validation_times(path: str) -> list[tuple[str, dict, float, str]]:
+    """
+    Read validation timings and skip failed model outputs.
+    """
+    return [
+        row for row in read_existing_validation(path) if "error" not in row[1]
+    ]
+
+
+def write_errorbar_svg(
+    path: str,
+    title: str,
+    rows: list[dict[str, float | int | str]],
+    unit: str,
+) -> None:
+    """
+    Write one horizontal min/mean/max SVG graph.
+    """
+    if not rows:
+        return
+    import html
+
+    model_chars = max(len(str(row["model"])) for row in rows)
+    stats_chars = max(
+        len(
+            f"avg {float(row['mean']):.2f}{unit} "
+            f"min {float(row['min']):.2f}{unit} "
+            f"max {float(row['max']):.2f}{unit} n={int(row['count'])}"
+        )
+        for row in rows
+    )
+    char_width = 8
+    left = max(300, min(620, model_chars * char_width + 25))
+    stats_width = max(360, stats_chars * char_width + 30)
+    right = stats_width + 40
+    top = 50
+    row_height = 30
+    width = left + 760 + right
+    height = top + len(rows) * row_height + 45
+    graph_width = width - left - right
+    max_value = max(float(row["max"]) for row in rows) or 1.0
+    stats_x = left + graph_width + 18
+
+    def xpos(value: float) -> int:
+        return left + int((value / max_value) * graph_width)
+
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
+        '<style>text{font-family:monospace;font-size:12px}</style>',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="10" y="25" font-size="18">{html.escape(title)}</text>',
+    ]
+    for index, row in enumerate(rows):
+        model = str(row["model"])
+        min_value = float(row["min"])
+        max_row_value = float(row["max"])
+        mean_value = float(row["mean"])
+        count = int(row["count"])
+        stats_text = (
+            f"avg {mean_value:.2f}{unit} min {min_value:.2f}{unit} "
+            f"max {max_row_value:.2f}{unit} n={count}"
+        )
+        y = top + index * row_height
+        min_x = xpos(min_value)
+        max_x = xpos(max_row_value)
+        mean_x = xpos(mean_value)
+        lines.append(f'<text x="10" y="{y + 15}">{html.escape(model)}</text>')
+        lines.append(
+            f'<line x1="{min_x}" y1="{y + 9}" x2="{max_x}" y2="{y + 9}" '
+            'stroke="#555" stroke-width="2"/>'
+        )
+        lines.append(
+            f'<line x1="{min_x}" y1="{y + 3}" x2="{min_x}" y2="{y + 15}" '
+            'stroke="#555" stroke-width="2"/>'
+        )
+        lines.append(
+            f'<line x1="{max_x}" y1="{y + 3}" x2="{max_x}" y2="{y + 15}" '
+            'stroke="#555" stroke-width="2"/>'
+        )
+        lines.append(
+            f'<circle cx="{mean_x}" cy="{y + 9}" r="5" fill="#3182bd"/>'
+        )
+        lines.append(
+            f'<text x="{stats_x}" y="{y + 14}">{html.escape(stats_text)}</text>'
+        )
+    lines.append("</svg>")
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def write_aggregate_table(
+    handle,
+    rows: list[dict],
+    unit: str,
+    label: str = "model",
+    show_errors: bool = True,
+) -> None:
+    """
+    Write common aggregate stats table.
+    """
+    if show_errors:
+        handle.write(
+            f"| {label} | reports | error reports | sum | average | min | max |\n"
+        )
+        handle.write("|---|---:|---:|---:|---:|---:|---:|\n")
+    else:
+        handle.write(f"| {label} | reports | sum | average | min | max |\n")
+        handle.write("|---|---:|---:|---:|---:|---:|\n")
+    for row in rows:
+        if show_errors:
+            handle.write(
+                f"| {row['model']} | {row['count']} | {row.get('errors', 0)} | "
+                f"{row.get('sum', 0.0)}{unit} | {row['mean']}{unit} | "
+                f"{row['min']}{unit} | {row['max']}{unit} |\n"
+            )
+        else:
+            handle.write(
+                f"| {row['model']} | {row['count']} | "
+                f"{row.get('sum', 0.0)}{unit} | {row['mean']}{unit} | "
+                f"{row['min']}{unit} | {row['max']}{unit} |\n"
+            )
+    handle.write("\n")
+
+
+def write_general_result(
+    path: str,
+    reports: list[dict],
+    classification_paths: list[str],
+    validation_paths: list[str],
+) -> None:
+    """
+    Write cross-report model summary for --doall.
+    """
+    contradictory_rows = aggregate_model_metric(
+        reports,
+        "most_contradictory_model",
+        "refuted_percent",
+    )
+    tagging_rows = aggregate_model_metric(
+        reports,
+        "best_model_for_tagging",
+        "found_percent",
+    )
+    best_rows = aggregate_model_metric(
+        reports,
+        "model_performance",
+        "validated_percent",
+    )
+    detection_time_rows = aggregate_elapsed_metric(
+        classification_paths,
+        read_detection_times,
+    )
+    validation_time_rows = aggregate_elapsed_metric(
+        validation_paths,
+        read_validation_times,
+    )
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    graph_paths = {
+        "contradictory": os.path.join(parent, "general_most_contradictory_model.svg"),
+        "tagging": os.path.join(parent, "general_best_model_for_tagging.svg"),
+        "best": os.path.join(parent, "general_best_models.svg"),
+        "detection_time": os.path.join(parent, "general_detection_time.svg"),
+        "validation_time": os.path.join(parent, "general_validation_time.svg"),
+    }
+    write_errorbar_svg(
+        graph_paths["contradictory"],
+        "Most contradictory model",
+        contradictory_rows,
+        "%",
+    )
+    write_errorbar_svg(
+        graph_paths["tagging"],
+        "Best model for tagging",
+        tagging_rows,
+        "%",
+    )
+    write_errorbar_svg(graph_paths["best"], "Best models", best_rows, "%")
+    write_errorbar_svg(
+        graph_paths["detection_time"],
+        "Detection processing time",
+        detection_time_rows,
+        "s",
+    )
+    write_errorbar_svg(
+        graph_paths["validation_time"],
+        "Validation processing time",
+        validation_time_rows,
+        "s",
+    )
+
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("# General result\n\n")
+        handle.write(
+            f"Reports aggregated: {len(reports)}. "
+            "Missing models are ignored per metric denominator.\n\n"
+        )
+
+        handle.write("## Most contradictory model\n\n")
+        handle.write(
+            "Cross-report contradiction rate. For each model, this averages the "
+            "percentage of proposed tags later rejected during validation. Models "
+            "that failed or did not produce usable tags are listed with a 100% "
+            "score for that report and counted in `error reports`.\n\n"
+        )
+        write_aggregate_table(handle, contradictory_rows, "%")
+        handle.write(
+            "![Most contradictory model]"
+            f"({relative_link(path, graph_paths['contradictory'])})\n\n"
+        )
+
+        handle.write("## Best model for tagging\n\n")
+        handle.write(
+            "Cross-report recall against consensus tags. For each model, this sums "
+            "and averages the percentage of most-approved tags found during the "
+            "initial tagging pass. Failed reports count as 0% and are counted in "
+            "`error reports`.\n\n"
+        )
+        write_aggregate_table(handle, tagging_rows, "%")
+        handle.write(
+            "![Best model for tagging]"
+            f"({relative_link(path, graph_paths['tagging'])})\n\n"
+        )
+
+        handle.write("## Best models\n\n")
+        handle.write(
+            "Cross-report precision score. For each model, this averages the "
+            "percentage of its proposed tags that validation confirmed as true. "
+            "High values mean the model avoids false positives; failed reports are "
+            "kept in the table with a 0% score and counted in `error reports`.\n\n"
+        )
+        write_aggregate_table(handle, best_rows, "%")
+        handle.write(f"![Best models]({relative_link(path, graph_paths['best'])})\n\n")
+
+        handle.write("## Detection time\n\n")
+        handle.write(
+            "Initial tagging latency. This aggregates `elapsed_second_request` from "
+            "`classification.md` for each model and shows average, minimum, and "
+            "maximum request time. Failed model outputs are not counted.\n\n"
+        )
+        write_aggregate_table(handle, detection_time_rows, "s", show_errors=False)
+        handle.write(
+            f"![Detection time]({relative_link(path, graph_paths['detection_time'])})\n\n"
+        )
+
+        handle.write("## Validation time\n\n")
+        handle.write(
+            "Validation latency. This aggregates `elapsed_second_request` from "
+            "`validation.md` for each model and shows average, minimum, and maximum "
+            "request time. Failed validation outputs are not counted.\n\n"
+        )
+        write_aggregate_table(handle, validation_time_rows, "s", show_errors=False)
+        handle.write(
+            f"![Validation time]({relative_link(path, graph_paths['validation_time'])})\n"
+        )
+
+
 def write_markdown(
     path: str,
     data: dict,
@@ -228,7 +595,8 @@ def write_markdown(
         handle.write("# Performance\n\n")
         handle.write("## Human summary\n\n")
         handle.write(
-            "Overview of collected model responses, validation coverage, and tag diversity.\n\n"
+            "Single-report overview of model responses, validation coverage, and "
+            "tag diversity for this channel sample.\n\n"
         )
         summary = data["summary"]
         summary_line = (
@@ -243,9 +611,9 @@ def write_markdown(
 
         handle.write("## Most approved tags\n\n")
         handle.write(
-            "Tags that validators accepted for at least 75% of collected model responses.\n\n"
+            "Consensus tags. These tags were validated as true by at least 75% of "
+            "models that produced usable validation results for this report.\n\n"
         )
-        handle.write("Tags that have been validated by all models > a 75%\n\n")
         handle.write("| tag | validated percent | validated | proposed |\n")
         handle.write("|---|---:|---:|---:|\n")
         for row in data["validated_tags_by_usage_percent"]:
@@ -259,22 +627,28 @@ def write_markdown(
 
         handle.write("## Best model for tagging\n\n")
         handle.write(
-            "Models ranked by how many of the most approved tags they found in their first tagging pass.\n\n"
+            "Recall against consensus tags. Models are ranked by how many of the "
+            "most approved tags they found during the initial tagging pass. A high "
+            "score means the model captures the expected common tags, even if it "
+            "also proposed extra tags elsewhere.\n\n"
         )
-        handle.write("| model | found | total | percent | found tags |\n")
-        handle.write("|---|---:|---:|---:|---|\n")
+        handle.write("| model | found | total | percent | error | found tags |\n")
+        handle.write("|---|---:|---:|---:|---:|---|\n")
         for row in data["best_model_for_tagging"]:
             handle.write(
                 f"| {row['model']} | {row['found_count']} | "
                 f"{row['total_most_approved_tags']} | "
                 f"{row['found_percent']}% | "
+                f"{'yes' if row.get('has_error') else 'no'} | "
                 f"{', '.join(row['found_tags'])} |\n"
             )
         handle.write("\n")
 
         handle.write("## Most validated tags\n\n")
         handle.write(
-            "Tags ranked by how often they were proposed, with validation counts and percentages.\n\n"
+            "Per-tag validation summary. Tags are ranked by proposal and validation "
+            "frequency, showing both how often models suggested each tag and how "
+            "often validation confirmed it.\n\n"
         )
         handle.write("| tag | validated | proposed | responses percent | proposed percent |\n")
         handle.write("|---|---:|---:|---:|---:|\n")
@@ -289,27 +663,35 @@ def write_markdown(
 
         handle.write("## Most contradictory model\n\n")
         handle.write(
-            "Models ranked by how often they proposed tags that their own validation later rejected.\n\n"
+            "Per-model contradiction rate for this report. This ranks models by the "
+            "share of their proposed tags that validation rejected. Models with "
+            "failed or unusable output are kept in the table and marked in the "
+            "`error` column.\n\n"
         )
-        handle.write("| model | tag refuted | total tag | % |\n")
-        handle.write("|---|---:|---:|---:|\n")
+        handle.write("| model | tag refuted | total tag | % | error |\n")
+        handle.write("|---|---:|---:|---:|---:|\n")
         for row in data["most_contradictory_model"]:
             handle.write(
                 f"| {row['model']} | {row['tag_refuted']} | "
-                f"{row['total_tag']} | {row['refuted_percent']}% |\n"
+                f"{row['total_tag']} | {row['refuted_percent']}% | "
+                f"{'yes' if row.get('has_error') else 'no'} |\n"
             )
         handle.write("\n")
 
         handle.write("## Best models\n\n")
         handle.write(
-            "Models ranked by the percentage of their proposed tags that were validated as true.\n\n"
+            "Per-model precision for this report. This ranks models by the "
+            "percentage of proposed tags confirmed as true. High values mean fewer "
+            "false positives; this is different from `Best model for tagging`, "
+            "which measures recall against consensus tags.\n\n"
         )
-        handle.write("| model | validated | proposed | percent |\n")
-        handle.write("|---|---:|---:|---:|\n")
+        handle.write("| model | validated | proposed | percent | error |\n")
+        handle.write("|---|---:|---:|---:|---:|\n")
         for row in data["model_performance"]:
             handle.write(
                 f"| {row['model']} | {row['validated_count']} | "
-                f"{row['proposed_count']} | {row['validated_percent']}% |\n"
+                f"{row['proposed_count']} | {row['validated_percent']}% | "
+                f"{'yes' if row.get('has_error') else 'no'} |\n"
             )
         handle.write("\n")
 
@@ -361,7 +743,10 @@ def default_paths(sample_path: str) -> dict[str, str]:
     }
 
 
-def analyze_sample(sample_path: str, args: argparse.Namespace) -> None:
+def analyze_sample(
+    sample_path: str,
+    args: argparse.Namespace,
+) -> tuple[dict[str, str], dict]:
     """
     Analyze one channel sample and write results.md.
     """
@@ -386,13 +771,15 @@ def analyze_sample(sample_path: str, args: argparse.Namespace) -> None:
         ("processing time", paths["processing_time_svg"]),
         ("validation processing time", paths["processing_time_validation_svg"]),
     ]
+    data = analyze(paths["evaluation"], paths["validation"])
     write_markdown(
         paths["output"],
-        analyze(paths["evaluation"], paths["validation"]),
+        data,
         image_paths,
         read_query_tokens(paths["query"]),
     )
     logger.info("Wrote %s", paths["output"])
+    return paths, data
 
 
 def main() -> int:
@@ -507,8 +894,25 @@ def main() -> int:
         logger.error("No sample_channel.json found")
         return 1
 
+    analyzed_reports = []
+    classification_paths = []
+    validation_paths = []
+    output_base_dir = os.path.dirname(os.path.dirname(sample_paths[0]))
     for sample_path in sample_paths:
-        analyze_sample(sample_path, args)
+        paths, data = analyze_sample(sample_path, args)
+        analyzed_reports.append(data)
+        classification_paths.append(paths["evaluation"])
+        validation_paths.append(paths["validation"])
+
+    if args.doall:
+        general_result_path = os.path.join(output_base_dir, "general_result.md")
+        write_general_result(
+            general_result_path,
+            analyzed_reports,
+            classification_paths,
+            validation_paths,
+        )
+        logger.info("Wrote %s", general_result_path)
     return 0
 
 

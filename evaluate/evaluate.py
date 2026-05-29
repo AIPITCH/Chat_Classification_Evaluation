@@ -29,6 +29,7 @@ from queries import TAG_EVALUATION_QUERY, TAXONOMY_TAG_EVALUATION_QUERY
 
 
 TOKEN_ENCODING = "o200k_base"
+ALLOWED_TAXONOMY_PREDICATES = {"topic", "motivation", "structure"}
 LOG_LEVELS = {
     "debug": logging.DEBUG,
     "info": logging.INFO,
@@ -233,6 +234,8 @@ def load_taxonomy_tags(path: str) -> dict[str, str]:
     data = load_json(path)
     tags = {}
     for value in data.get("values") or []:
+        if value.get("predicate") not in ALLOWED_TAXONOMY_PREDICATES:
+            continue
         for entry in value.get("entry") or []:
             if entry.get("uuid") and entry.get("value"):
                 tags[entry["uuid"].lower()] = entry["value"]
@@ -246,6 +249,8 @@ def load_taxonomy_prompt_entries(path: str) -> list[str]:
     data = load_json(path)
     entries = []
     for value in data.get("values") or []:
+        if value.get("predicate") not in ALLOWED_TAXONOMY_PREDICATES:
+            continue
         for entry in value.get("entry") or []:
             if entry.get("uuid") and entry.get("value"):
                 description = entry.get("description") or entry.get("expanded") or ""
@@ -500,6 +505,7 @@ def prepare_channel_outputs(
     force: bool,
     models: list[str],
     retry_model: str | None = None,
+    retry_error: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Load samples and existing output state for each channel.
@@ -512,24 +518,40 @@ def prepare_channel_outputs(
             "classification.md",
         )
         query_path = os.path.join(channel_output_dir(sample_channel), "query.md")
-        results = (
-            []
-            if force
-            else read_existing_results(
+        retry_models = None
+        results = []
+        if not force:
+            results = read_existing_results(
                 output_path,
                 taxo_mode,
                 taxonomy_tags,
-                strict=not bool(retry_model),
+                strict=not bool(retry_model or retry_error),
             )
-        )
         if retry_model:
             results = [result for result in results if result[0] != retry_model]
+            retry_models = {retry_model}
+        elif retry_error:
+            retry_models = {
+                model
+                for model, tags, _, _ in results
+                if model in models and tags.startswith("ERROR:")
+            }
+            results = [
+                result
+                for result in results
+                if result[0] in models and result[0] not in retry_models
+            ]
         else:
             results = [result for result in results if result[0] in models]
         query_text = build_query(sample_channel, taxo_mode, taxo_file)
         write_query_markdown(query_path, query_text)
-        if retry_model:
+        if retry_model or (retry_error and retry_models):
             write_markdown(output_path, results)
+        if retry_error and not retry_models:
+            logger.info(
+                "No failed classification to retry in %s",
+                channel_id(sample_channel),
+            )
         channels.append(
             {
                 "sample_path": sample_path,
@@ -538,6 +560,7 @@ def prepare_channel_outputs(
                 "query_path": query_path,
                 "query_text": query_text,
                 "results": results,
+                "retry_models": retry_models,
             }
         )
     return channels
@@ -559,7 +582,11 @@ def evaluate_channels(
         1
         for model in models
         for channel in channels
-        if model not in {result[0] for result in channel["results"]}
+        if (
+            channel.get("retry_models") is None
+            or model in channel.get("retry_models", set())
+        )
+        and model not in {result[0] for result in channel["results"]}
     )
     completed_queries = 0
 
@@ -579,7 +606,11 @@ def evaluate_channels(
         pending = [
             channel
             for channel in channels
-            if model not in {result[0] for result in channel["results"]}
+            if (
+                channel.get("retry_models") is None
+                or model in channel.get("retry_models", set())
+            )
+            and model not in {result[0] for result in channel["results"]}
         ]
         if not pending:
             logger.info("%s Skipping %s: already done everywhere", progress(), model)
@@ -724,6 +755,11 @@ def main() -> int:
         default=None,
         help="Flush this model from classification.md and rerun only it",
     )
+    parser.add_argument(
+        "--retry-error",
+        action="store_true",
+        help="Flush failed classification entries and rerun only those models",
+    )
     parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout")
     args = parser.parse_args()
     set_results_dir(args.folder)
@@ -742,10 +778,16 @@ def main() -> int:
         model for model in get_models(api_base, args.timeout) if model not in blacklist
     ]
     if args.retry_model:
+        if args.retry_error:
+            logger.error("Use either --retry-model or --retry-error")
+            return 1
         if args.retry_model not in models:
             logger.error("Retry model not available: %s", args.retry_model)
             return 1
         models = [args.retry_model]
+    if args.force and args.retry_error:
+        logger.error("Use either --force or --retry-error")
+        return 1
     if not models:
         logger.error("No model returned by /list_model")
         return 1
@@ -785,6 +827,7 @@ def main() -> int:
         args.force,
         models,
         args.retry_model,
+        args.retry_error,
     )
     evaluate_channels(
         api_base,

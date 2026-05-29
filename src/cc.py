@@ -53,6 +53,7 @@ LOG_LEVELS = {
 MODEL_CACHE: list[dict[str, Any]] = []
 CONFIG: dict[str, Any] = {}
 TAXONOMY_TAGS: list[str] = []
+ALLOWED_TAXONOMY_PREDICATES = {"topic", "motivation", "structure"}
 
 
 def load_config() -> dict[str, Any]:
@@ -214,6 +215,8 @@ def load_taxonomy_tags() -> list[str]:
 
     tags = []
     for value in taxonomy.get("values") or []:
+        if value.get("predicate") not in ALLOWED_TAXONOMY_PREDICATES:
+            continue
         for entry in value.get("entry") or []:
             if entry.get("uuid") and entry.get("value"):
                 description = entry.get("description") or entry.get("expanded") or ""

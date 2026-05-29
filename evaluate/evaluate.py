@@ -341,10 +341,19 @@ def normalize_taxonomy_tags(raw_output: str, taxonomy_tags: dict[str, str]) -> s
     )
     if uuids:
         values = []
+        invalid_uuids = []
         for uuid in [uuid.lower() for uuid in uuids]:
             if uuid not in taxonomy_tags:
-                raise ValueError("not a taxonomy tag")
+                invalid_uuids.append(uuid)
+                continue
             values.append(taxonomy_tags[uuid])
+        if invalid_uuids:
+            logger.warning(
+                "Dropped invalid taxonomy UUID(s): %s",
+                ", ".join(sorted(set(invalid_uuids))),
+            )
+        if not values:
+            raise ValueError("not a taxonomy tag")
         return ",".join(sorted(set(values), key=str.casefold))
 
     raw_tags = raw_output.replace("\r", "\n").replace(",", "\n").splitlines()

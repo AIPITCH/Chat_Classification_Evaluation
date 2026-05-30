@@ -478,6 +478,7 @@ def validate_channels(
     timeout: int,
     taxo_mode: bool,
     retry_model: str | None = None,
+    max_parse_retries: int = 2,
 ) -> None:
     """
     Validate model-first, channel-second.
@@ -548,17 +549,30 @@ def validate_channels(
                 raw_output = ""
                 try:
                     start_time = time.perf_counter()
-                    result, raw_output = validate_model(
-                        api_base,
-                        channel["sample_channel"],
-                        model,
-                        channel["all_tags"],
-                        timeout,
-                        taxo_mode,
-                    )
+                    for attempt in range(max_parse_retries + 1):
+                        result, raw_output = validate_model(
+                            api_base,
+                            channel["sample_channel"],
+                            model,
+                            channel["all_tags"],
+                            timeout,
+                            taxo_mode,
+                        )
+                        if "error" not in result or attempt >= max_parse_retries:
+                            break
+                        logger.warning(
+                            "%s %s on %s: invalid validation output (%s), "
+                            "retry %d/%d",
+                            progress(query_number),
+                            model,
+                            channel_name,
+                            result.get("error"),
+                            attempt + 1,
+                            max_parse_retries,
+                        )
                     elapsed = time.perf_counter() - start_time
                 except (requests.RequestException, json.JSONDecodeError) as error:
-                    elapsed = 0.0
+                    elapsed = time.perf_counter() - start_time
                     result = {"error": str(error)}
                     raw_output = str(error)
                     logger.error(
@@ -700,6 +714,12 @@ def main() -> int:
         action="store_true",
         help="Flush failed validation entries and rerun only those models",
     )
+    parser.add_argument(
+        "--parse-retries",
+        type=int,
+        default=2,
+        help="Retry invalid validation output parsing this many times",
+    )
     parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout")
     args = parser.parse_args()
     set_results_dir(args.folder)
@@ -760,6 +780,7 @@ def main() -> int:
         args.timeout,
         taxo_mode,
         args.retry_model,
+        args.parse_retries,
     )
     return 0
 

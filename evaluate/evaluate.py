@@ -583,6 +583,7 @@ def evaluate_channels(
     timeout: int,
     taxo_mode: bool,
     taxonomy_tags: dict[str, str],
+    max_parse_retries: int = 2,
 ) -> None:
     """
     Evaluate models with model outer loop, channel inner loop.
@@ -651,20 +652,43 @@ def evaluate_channels(
                 raw_output = ""
                 try:
                     start_time = time.perf_counter()
-                    raw_output = evaluate_model(
-                        api_base,
-                        channel["sample_channel"],
-                        model,
-                        timeout,
-                        taxo_mode,
-                    )
-                    if taxo_mode:
-                        tags = normalize_taxonomy_tags(raw_output, taxonomy_tags)
-                    else:
-                        tags = sort_csv_tags(raw_output)
+                    last_error: ValueError | None = None
+                    for attempt in range(max_parse_retries + 1):
+                        raw_output = evaluate_model(
+                            api_base,
+                            channel["sample_channel"],
+                            model,
+                            timeout,
+                            taxo_mode,
+                        )
+                        try:
+                            if taxo_mode:
+                                tags = normalize_taxonomy_tags(
+                                    raw_output,
+                                    taxonomy_tags,
+                                )
+                            else:
+                                tags = sort_csv_tags(raw_output)
+                            last_error = None
+                            break
+                        except ValueError as error:
+                            last_error = error
+                            if attempt >= max_parse_retries:
+                                raise
+                            logger.warning(
+                                "%s %s on %s: invalid output (%s), retry %d/%d",
+                                progress(query_number),
+                                model,
+                                channel_name,
+                                error,
+                                attempt + 1,
+                                max_parse_retries,
+                            )
+                    if last_error is not None:
+                        raise last_error
                     elapsed = time.perf_counter() - start_time
                 except ValueError as error:
-                    elapsed = 0.0
+                    elapsed = time.perf_counter() - start_time
                     tags = f"ERROR: {error}"
                     logger.error(
                         "%s %s on %s: %s",
@@ -674,7 +698,7 @@ def evaluate_channels(
                         error,
                     )
                 except requests.RequestException as error:
-                    elapsed = 0.0
+                    elapsed = time.perf_counter() - start_time
                     tags = f"ERROR: {error}"
                     raw_output = str(error)
                     logger.error(
@@ -769,6 +793,12 @@ def main() -> int:
         action="store_true",
         help="Flush failed classification entries and rerun only those models",
     )
+    parser.add_argument(
+        "--parse-retries",
+        type=int,
+        default=2,
+        help="Retry invalid model output parsing this many times",
+    )
     parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout")
     args = parser.parse_args()
     set_results_dir(args.folder)
@@ -846,6 +876,7 @@ def main() -> int:
         args.timeout,
         taxo_mode,
         taxonomy_tags,
+        args.parse_retries,
     )
 
     return 0

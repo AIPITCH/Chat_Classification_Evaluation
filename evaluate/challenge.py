@@ -177,6 +177,16 @@ def read_existing_validation(path: str) -> list[tuple[str, dict[str, Any], float
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
             stripped = line.rstrip("\n")
+            if in_raw and stripped == "```":
+                if in_raw_fence:
+                    in_raw_fence = False
+                    in_raw = False
+                else:
+                    in_raw_fence = True
+                continue
+            if in_raw and in_raw_fence:
+                raw_lines.append(stripped)
+                continue
             if stripped.startswith("# "):
                 flush()
                 current_model = stripped[2:].strip()
@@ -208,11 +218,6 @@ def read_existing_validation(path: str) -> list[tuple[str, dict[str, Any], float
             if stripped == "raw output:":
                 in_raw = True
                 continue
-            if in_raw and stripped == "```":
-                in_raw_fence = not in_raw_fence
-                continue
-            if in_raw and in_raw_fence:
-                raw_lines.append(stripped)
     flush()
     return results
 

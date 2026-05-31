@@ -451,6 +451,17 @@ def read_existing_results(
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
             stripped = line.rstrip("\n")
+            if in_raw_output and stripped == "```":
+                if in_raw_fence:
+                    in_raw_fence = False
+                    in_raw_output = False
+                else:
+                    in_raw_fence = True
+                continue
+            if in_raw_output:
+                if in_raw_fence:
+                    current_raw_lines.append(stripped)
+                continue
             if stripped.startswith("# "):
                 flush()
                 current_model = stripped[2:].strip()
@@ -464,13 +475,6 @@ def read_existing_results(
                 continue
             if stripped == "raw output:":
                 in_raw_output = True
-                continue
-            if in_raw_output and stripped == "```":
-                in_raw_fence = not in_raw_fence
-                continue
-            if in_raw_output:
-                if in_raw_fence:
-                    current_raw_lines.append(stripped)
                 continue
             if stripped.startswith("elapsed_second_request:"):
                 value = stripped.split(":", 1)[1].strip().rstrip("s")

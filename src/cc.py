@@ -105,6 +105,21 @@ def ollama_request(
     return response.json()
 
 
+def parse_timeout(value: Any) -> int | None:
+    """
+    Parse optional request timeout override.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("timeout must be integer") from error
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    return timeout
+
+
 def human_size(size_bytes: int | None) -> str:
     """
     Convert byte count to compact human-readable value.
@@ -284,13 +299,14 @@ def evaluate_tags(
     sample_channel: Any,
     model: str | None = None,
     taxo: bool = False,
+    timeout_override: int | None = None,
 ) -> str:
     """
     Ask Ollama to classify a channel sample.
     """
     ollama_config = CONFIG.get("ollama") or {}
     api_base = str(ollama_config.get("api_base") or "http://localhost:11434").rstrip("/")
-    timeout = int(ollama_config.get("timeout") or 240)
+    timeout = timeout_override or int(ollama_config.get("timeout") or 240)
     temperature = float(ollama_config.get("temperature", 0.1))
     model_name = model or str(ollama_config.get("model") or "")
     if not model_name:
@@ -322,13 +338,16 @@ def evaluate_tags(
     return str(response.get("response", "")).strip()
 
 
-def warmup_model(model: str | None = None) -> None:
+def warmup_model(
+    model: str | None = None,
+    timeout_override: int | None = None,
+) -> None:
     """
     Send a tiny prompt to load a model before timed requests.
     """
     ollama_config = CONFIG.get("ollama") or {}
     api_base = str(ollama_config.get("api_base") or "http://localhost:11434").rstrip("/")
-    timeout = int(ollama_config.get("timeout") or 240)
+    timeout = timeout_override or int(ollama_config.get("timeout") or 240)
     temperature = float(ollama_config.get("temperature", 0.1))
     model_name = model or str(ollama_config.get("model") or "")
     if not model_name:
@@ -394,13 +413,14 @@ def validate_tags(
     tags: list[str],
     model: str | None = None,
     taxo: bool = False,
+    timeout_override: int | None = None,
 ) -> str:
     """
     Ask Ollama to justify and validate tags against a channel sample.
     """
     ollama_config = CONFIG.get("ollama") or {}
     api_base = str(ollama_config.get("api_base") or "http://localhost:11434").rstrip("/")
-    timeout = int(ollama_config.get("timeout") or 240)
+    timeout = timeout_override or int(ollama_config.get("timeout") or 240)
     temperature = float(ollama_config.get("temperature", 0.1))
     model_name = model or str(ollama_config.get("model") or "")
     if not model_name:
@@ -478,7 +498,7 @@ def create_app() -> Flask:
             sample_channel = {
                 key: value
                 for key, value in payload.items()
-                if key not in {"model", "taxo"}
+                if key not in {"model", "taxo", "timeout"}
             }
         model = payload.get("model") or request.args.get("model")
         taxo = str(payload.get("taxo") or request.args.get("taxo") or "").lower() in {
@@ -492,7 +512,10 @@ def create_app() -> Flask:
             return jsonify({"error": "model must be string"}), 400
 
         try:
-            labels = evaluate_tags(sample_channel, model, taxo)
+            timeout_override = parse_timeout(
+                payload.get("timeout") or request.args.get("timeout")
+            )
+            labels = evaluate_tags(sample_channel, model, taxo, timeout_override)
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
         except requests.RequestException as error:
@@ -512,7 +535,10 @@ def create_app() -> Flask:
             return jsonify({"error": "model must be string"}), 400
 
         try:
-            warmup_model(model)
+            timeout_override = parse_timeout(
+                payload.get("timeout") or request.args.get("timeout")
+            )
+            warmup_model(model, timeout_override)
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
         except requests.RequestException as error:
@@ -533,7 +559,7 @@ def create_app() -> Flask:
             sample_channel = {
                 key: value
                 for key, value in payload.items()
-                if key not in {"model", "tags", "labels", "taxo"}
+                if key not in {"model", "tags", "labels", "taxo", "timeout"}
             }
         model = payload.get("model") or request.args.get("model")
         taxo = str(payload.get("taxo") or request.args.get("taxo") or "").lower() in {
@@ -556,8 +582,17 @@ def create_app() -> Flask:
             return jsonify({"error": "model must be string"}), 400
 
         try:
+            timeout_override = parse_timeout(
+                payload.get("timeout") or request.args.get("timeout")
+            )
             tags = parse_tags(tags_value)
-            raw_output = validate_tags(sample_channel, tags, model, taxo)
+            raw_output = validate_tags(
+                sample_channel,
+                tags,
+                model,
+                taxo,
+                timeout_override,
+            )
             result = extract_raw_json(raw_output)
         except json.JSONDecodeError as error:
             logger.error("Ollama validation returned invalid JSON: %s", error)

@@ -83,6 +83,7 @@ def validate_model(
                 "model": model,
                 "include_raw": "true",
                 "taxo": "true" if taxo else "false",
+                "timeout": str(timeout),
             },
             json={
                 "sample_channel": sample_channel,

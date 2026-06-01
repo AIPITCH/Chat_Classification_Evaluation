@@ -171,7 +171,11 @@ def evaluate_model(
     """
     response = requests.post(
         f"{api_base}/evaluate_tags",
-        params={"model": model, "taxo": "true" if taxo else "false"},
+        params={
+            "model": model,
+            "taxo": "true" if taxo else "false",
+            "timeout": str(timeout),
+        },
         json={"sample_channel": sample_channel},
         timeout=timeout,
     )
@@ -185,7 +189,7 @@ def warmup_model(api_base: str, model: str, timeout: int) -> None:
     """
     response = requests.post(
         f"{api_base}/warmup_model",
-        params={"model": model},
+        params={"model": model, "timeout": str(timeout)},
         timeout=timeout,
     )
     response.raise_for_status()

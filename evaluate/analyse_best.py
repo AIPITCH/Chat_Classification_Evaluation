@@ -140,8 +140,16 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
         row["tag"] for row in tag_rows if row["validated_percent_of_responses"] >= 75
     }
     tagging_rows = []
+    balanced_rows = []
     for model in all_evaluation_models:
         has_error = model not in model_tags or model not in validation_by_model
+        proposed_tags = sorted(model_tags.get(model, set()), key=str.casefold)
+        matches = validation_by_model.get(model, {})
+        validated_tags = [
+            tag for tag in proposed_tags if matches.get(tag.casefold()) is True
+        ]
+        proposed_count = len(proposed_tags)
+        validated_count = len(validated_tags)
         proposed_approved = sorted(
             model_tags.get(model, set()).intersection(approved_tags),
             key=str.casefold,
@@ -162,6 +170,34 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
                     approved_tags.difference(proposed_approved),
                     key=str.casefold,
                 ),
+            }
+        )
+        precision = (
+            round((validated_count / proposed_count) * 100, 2)
+            if proposed_count and not has_error
+            else 0.0
+        )
+        recall = (
+            round((found_count / total_approved) * 100, 2)
+            if total_approved and not has_error
+            else 0.0
+        )
+        f1_score = (
+            round((2 * precision * recall) / (precision + recall), 2)
+            if precision + recall
+            else 0.0
+        )
+        balanced_rows.append(
+            {
+                "model": model,
+                "precision_percent": precision,
+                "recall_percent": recall,
+                "balanced_f1_percent": f1_score,
+                "validated_count": validated_count,
+                "proposed_count": proposed_count,
+                "found_count": found_count,
+                "total_most_approved_tags": total_approved,
+                "has_error": has_error,
             }
         )
 
@@ -187,6 +223,16 @@ def analyze(evaluation_path: str, validation_path: str) -> dict:
             key=lambda row: (
                 row["validated_percent"],
                 row["validated_count"],
+                row["model"].casefold(),
+            ),
+            reverse=True,
+        ),
+        "best_balanced_model": sorted(
+            balanced_rows,
+            key=lambda row: (
+                row["balanced_f1_percent"],
+                row["precision_percent"],
+                row["recall_percent"],
                 row["model"].casefold(),
             ),
             reverse=True,
@@ -231,13 +277,27 @@ def metric_stats(values: list[float]) -> dict[str, float | int]:
     Return count/min/max/mean for one model metric.
     """
     if not values:
-        return {"count": 0, "sum": 0.0, "min": 0.0, "max": 0.0, "mean": 0.0}
+        return {
+            "count": 0,
+            "sum": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+        }
+    sorted_values = sorted(values)
+    middle = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        median = sorted_values[middle]
+    else:
+        median = (sorted_values[middle - 1] + sorted_values[middle]) / 2
     return {
         "count": len(values),
         "sum": round(sum(values), 2),
         "min": round(min(values), 2),
         "max": round(max(values), 2),
         "mean": round(sum(values) / len(values), 2),
+        "median": round(median, 2),
     }
 
 
@@ -270,6 +330,7 @@ def aggregate_model_metric(
     return sorted(
         rows,
         key=lambda row: (
+            float(row["median"]),
             float(row["mean"]),
             int(row["count"]),
             str(row["model"]).casefold(),
@@ -298,11 +359,104 @@ def aggregate_elapsed_metric(
     return sorted(
         rows,
         key=lambda row: (
+            float(row["median"]),
             float(row["mean"]),
             int(row["count"]),
             str(row["model"]).casefold(),
         ),
     )
+
+
+def aggregate_failure_metric(
+    classification_paths: list[str],
+    validation_paths: list[str],
+) -> list[dict[str, float | int | str]]:
+    """
+    Aggregate failed initial tagging and correction/validation attempts.
+    """
+    stats_by_model: dict[str, dict[str, int | set[str]]] = {}
+
+    def model_stats(model: str) -> dict[str, int | set[str]]:
+        if model not in stats_by_model:
+            stats_by_model[model] = {
+                "reports": set(),
+                "initial_attempts": 0,
+                "initial_errors": 0,
+                "correction_attempts": 0,
+                "correction_errors": 0,
+            }
+        return stats_by_model[model]
+
+    for path in classification_paths:
+        report_id = os.path.basename(os.path.dirname(path))
+        for model, tags, _, _ in read_existing_results(path, strict=False):
+            stats = model_stats(str(model))
+            stats["reports"].add(report_id)
+            stats["initial_attempts"] += 1
+            if str(tags).startswith("ERROR:"):
+                stats["initial_errors"] += 1
+
+    for path in validation_paths:
+        report_id = os.path.basename(os.path.dirname(path))
+        for model, result, _, _ in read_existing_validation(path):
+            stats = model_stats(str(model))
+            stats["reports"].add(report_id)
+            stats["correction_attempts"] += 1
+            if "error" in result:
+                stats["correction_errors"] += 1
+
+    rows = []
+    for model, stats in stats_by_model.items():
+        initial_attempts = int(stats["initial_attempts"])
+        initial_errors = int(stats["initial_errors"])
+        correction_attempts = int(stats["correction_attempts"])
+        correction_errors = int(stats["correction_errors"])
+        attempts = initial_attempts + correction_attempts
+        total_errors = initial_errors + correction_errors
+        score = round((total_errors / attempts) * 100, 2) if attempts else 0.0
+        rows.append(
+            {
+                "model": model,
+                "reports": len(stats["reports"]),
+                "initial_attempts": initial_attempts,
+                "initial_errors": initial_errors,
+                "correction_attempts": correction_attempts,
+                "correction_errors": correction_errors,
+                "attempts": attempts,
+                "total_errors": total_errors,
+                "score": score,
+            }
+        )
+
+    return sorted(
+        rows,
+        key=lambda row: (
+            float(row["score"]),
+            int(row["total_errors"]),
+            int(row["reports"]),
+            str(row["model"]).casefold(),
+        ),
+        reverse=True,
+    )
+
+
+def write_failure_table(handle, rows: list[dict]) -> None:
+    """
+    Write global failure score table.
+    """
+    handle.write(
+        "| model | reports | initial tagging errors | correction errors | "
+        "total errors | attempts | score |\n"
+    )
+    handle.write("|---|---:|---:|---:|---:|---:|---:|\n")
+    for row in rows:
+        handle.write(
+            f"| {row['model']} | {row['reports']} | "
+            f"{row['initial_errors']}/{row['initial_attempts']} | "
+            f"{row['correction_errors']}/{row['correction_attempts']} | "
+            f"{row['total_errors']} | {row['attempts']} | {row['score']}% |\n"
+        )
+    handle.write("\n")
 
 
 def read_detection_times(path: str) -> list[tuple[str, str, float, str]]:
@@ -342,6 +496,7 @@ def write_errorbar_svg(
     stats_chars = max(
         len(
             f"avg {float(row['mean']):.2f}{unit} "
+            f"med {float(row['median']):.2f}{unit} "
             f"min {float(row['min']):.2f}{unit} "
             f"max {float(row['max']):.2f}{unit} n={int(row['count'])}"
         )
@@ -373,15 +528,17 @@ def write_errorbar_svg(
         min_value = float(row["min"])
         max_row_value = float(row["max"])
         mean_value = float(row["mean"])
+        median_value = float(row["median"])
         count = int(row["count"])
         stats_text = (
-            f"avg {mean_value:.2f}{unit} min {min_value:.2f}{unit} "
-            f"max {max_row_value:.2f}{unit} n={count}"
+            f"avg {mean_value:.2f}{unit} med {median_value:.2f}{unit} "
+            f"min {min_value:.2f}{unit} max {max_row_value:.2f}{unit} n={count}"
         )
         y = top + index * row_height
         min_x = xpos(min_value)
         max_x = xpos(max_row_value)
         mean_x = xpos(mean_value)
+        median_x = xpos(median_value)
         lines.append(f'<text x="10" y="{y + 15}">{html.escape(model)}</text>')
         lines.append(
             f'<line x1="{min_x}" y1="{y + 9}" x2="{max_x}" y2="{y + 9}" '
@@ -397,6 +554,10 @@ def write_errorbar_svg(
         )
         lines.append(
             f'<circle cx="{mean_x}" cy="{y + 9}" r="5" fill="#3182bd"/>'
+        )
+        lines.append(
+            f'<polygon points="{median_x},{y + 2} {median_x - 6},{y + 15} '
+            f'{median_x + 6},{y + 15}" fill="#de2d26"/>'
         )
         lines.append(
             f'<text x="{stats_x}" y="{y + 14}">{html.escape(stats_text)}</text>'
@@ -422,24 +583,26 @@ def write_aggregate_table(
     """
     if show_errors:
         handle.write(
-            f"| {label} | reports | error reports | sum | average | min | max |\n"
+            f"| {label} | reports | error reports | sum | average | median | min | max |\n"
         )
-        handle.write("|---|---:|---:|---:|---:|---:|---:|\n")
+        handle.write("|---|---:|---:|---:|---:|---:|---:|---:|\n")
     else:
-        handle.write(f"| {label} | reports | sum | average | min | max |\n")
-        handle.write("|---|---:|---:|---:|---:|---:|\n")
+        handle.write(f"| {label} | reports | sum | average | median | min | max |\n")
+        handle.write("|---|---:|---:|---:|---:|---:|---:|\n")
     for row in rows:
         if show_errors:
             handle.write(
                 f"| {row['model']} | {row['count']} | {row.get('errors', 0)} | "
                 f"{row.get('sum', 0.0)}{unit} | {row['mean']}{unit} | "
-                f"{row['min']}{unit} | {row['max']}{unit} |\n"
+                f"{row['median']}{unit} | {row['min']}{unit} | "
+                f"{row['max']}{unit} |\n"
             )
         else:
             handle.write(
                 f"| {row['model']} | {row['count']} | "
                 f"{row.get('sum', 0.0)}{unit} | {row['mean']}{unit} | "
-                f"{row['min']}{unit} | {row['max']}{unit} |\n"
+                f"{row['median']}{unit} | {row['min']}{unit} | "
+                f"{row['max']}{unit} |\n"
             )
     handle.write("\n")
 
@@ -453,6 +616,7 @@ def write_general_result(
     """
     Write cross-report model summary for --doall.
     """
+    failing_rows = aggregate_failure_metric(classification_paths, validation_paths)
     contradictory_rows = aggregate_model_metric(
         reports,
         "most_contradictory_model",
@@ -462,6 +626,11 @@ def write_general_result(
         reports,
         "best_model_for_tagging",
         "found_percent",
+    )
+    balanced_rows = aggregate_model_metric(
+        reports,
+        "best_balanced_model",
+        "balanced_f1_percent",
     )
     best_rows = aggregate_model_metric(
         reports,
@@ -483,6 +652,7 @@ def write_general_result(
     graph_paths = {
         "contradictory": os.path.join(parent, "general_most_contradictory_model.svg"),
         "tagging": os.path.join(parent, "general_best_model_for_tagging.svg"),
+        "balanced": os.path.join(parent, "general_best_balanced_models.svg"),
         "best": os.path.join(parent, "general_best_models.svg"),
         "detection_time": os.path.join(parent, "general_detection_time.svg"),
         "validation_time": os.path.join(parent, "general_validation_time.svg"),
@@ -495,11 +665,17 @@ def write_general_result(
     )
     write_errorbar_svg(
         graph_paths["tagging"],
-        "Best model for tagging",
+        "Best model for tagging consensus",
         tagging_rows,
         "%",
     )
-    write_errorbar_svg(graph_paths["best"], "Best models", best_rows, "%")
+    write_errorbar_svg(
+        graph_paths["balanced"],
+        "Best model that do not overtag",
+        balanced_rows,
+        "%",
+    )
+    write_errorbar_svg(graph_paths["best"], "Best model for tagging", best_rows, "%")
     write_errorbar_svg(
         graph_paths["detection_time"],
         "Detection processing time",
@@ -520,12 +696,25 @@ def write_general_result(
             "Missing models are ignored per metric denominator.\n\n"
         )
 
+        handle.write("## Most failing model\n\n")
+        handle.write(
+            "This score measures which models most often failed to answer in time "
+            "or returned invalid tagging/correction output. It counts both initial "
+            "tagging errors from `classification.md` and correction/validation "
+            "errors from `validation.md`. The score is "
+            "`(initial tagging errors + correction errors) / "
+            "(initial tagging attempts + correction attempts) * 100`. Higher is "
+            "worse: models at the top failed most often.\n\n"
+        )
+        write_failure_table(handle, failing_rows)
+
         handle.write("## Most contradictory model\n\n")
         handle.write(
             "Cross-report contradiction rate. For each model, this averages the "
             "percentage of proposed tags later rejected during validation. Models "
             "that failed or did not produce usable tags are listed with a 100% "
-            "score for that report and counted in `error reports`.\n\n"
+            "score for that report and counted in `error reports`. Lower is "
+            "better: the best score tends toward 0%.\n\n"
         )
         write_aggregate_table(handle, contradictory_rows, "%")
         handle.write(
@@ -533,28 +722,62 @@ def write_general_result(
             f"({relative_link(path, graph_paths['contradictory'])})\n\n"
         )
 
-        handle.write("## Best model for tagging\n\n")
+        handle.write("## Best model for tagging consensus\n\n")
         handle.write(
-            "Cross-report recall against consensus tags. For each model, this sums "
-            "and averages the percentage of most-approved tags found during the "
-            "initial tagging pass. Failed reports count as 0% and are counted in "
-            "`error reports`.\n\n"
+            "This score measures how well each model finds the consensus tags "
+            "across all reports. The consensus tags are the tags most approved by "
+            "validation, so they are treated as the expected important tags for a "
+            "report. For each report, the model score is the percentage of "
+            "consensus tags found during the initial tagging pass. A high score "
+            "means the model usually finds the tags that validators agree are "
+            "important. This metric mainly measures recall against consensus; it "
+            "does not primarily measure whether the model added extra tags. Failed "
+            "reports count as 0% and are counted in `error reports`.\n\n"
         )
         write_aggregate_table(handle, tagging_rows, "%")
         handle.write(
-            "![Best model for tagging]"
+            "![Best model for tagging consensus]"
             f"({relative_link(path, graph_paths['tagging'])})\n\n"
         )
 
-        handle.write("## Best models\n\n")
+        handle.write("## Best model that do not overtag\n\n")
         handle.write(
-            "Cross-report precision score. For each model, this averages the "
-            "percentage of its proposed tags that validation confirmed as true. "
-            "High values mean the model avoids false positives; failed reports are "
-            "kept in the table with a 0% score and counted in `error reports`.\n\n"
+            "This score measures whether each model finds the right tags without "
+            "adding too many wrong or useless tags. For each report, precision is "
+            "`validated tags / proposed tags`, so it drops when the model proposes "
+            "false or irrelevant tags. Recall is `consensus tags found / total "
+            "consensus tags`, so it drops when the model misses important expected "
+            "tags. The displayed score is F1: "
+            "`2 * precision * recall / (precision + recall)`. This balances tag "
+            "quality and tag coverage: a model ranks well only when it keeps high "
+            "precision and high recall. Failed reports count as 0% and are counted "
+            "in `error reports`.\n\n"
+        )
+        write_aggregate_table(handle, balanced_rows, "%")
+        handle.write(
+            "![Best model that do not overtag]"
+            f"({relative_link(path, graph_paths['balanced'])})\n\n"
+        )
+
+        handle.write("## Best model for tagging\n\n")
+        handle.write(
+            "This score measures how reliable each model's proposed tags are "
+            "across all reports. For each report, the score is the percentage of "
+            "the model's proposed tags that validation confirmed as true: "
+            "`validated tags / proposed tags`. A high score means the model avoids "
+            "false positives and usually proposes tags that validators accept. "
+            "This is different from `Best model for tagging consensus`, which "
+            "measures whether the model found the expected consensus tags. This "
+            "metric does not care whether a tag is part of the consensus: a "
+            "non-consensus tag is not penalized if validation confirms it as true. "
+            "It is penalized if validation rejects it, or if it is not confirmed "
+            "as true. Failed reports are kept in the table with a 0% score and "
+            "counted in `error reports`.\n\n"
         )
         write_aggregate_table(handle, best_rows, "%")
-        handle.write(f"![Best models]({relative_link(path, graph_paths['best'])})\n\n")
+        handle.write(
+            f"![Best model for tagging]({relative_link(path, graph_paths['best'])})\n\n"
+        )
 
         handle.write("## Detection time\n\n")
         handle.write(
@@ -625,12 +848,15 @@ def write_markdown(
                 )
         handle.write("\n")
 
-        handle.write("## Best model for tagging\n\n")
+        handle.write("## Best model for tagging consensus\n\n")
         handle.write(
-            "Recall against consensus tags. Models are ranked by how many of the "
-            "most approved tags they found during the initial tagging pass. A high "
-            "score means the model captures the expected common tags, even if it "
-            "also proposed extra tags elsewhere.\n\n"
+            "This score measures whether each model found the consensus tags for "
+            "this report. Consensus tags are the tags most approved by validation, "
+            "so they are treated as the expected important tags. The score is the "
+            "percentage of consensus tags found during the initial tagging pass. A "
+            "high score means the model captured the tags validators agree are "
+            "important. This metric mainly measures recall against consensus; it "
+            "does not primarily measure whether the model added extra tags.\n\n"
         )
         handle.write("| model | found | total | percent | error | found tags |\n")
         handle.write("|---|---:|---:|---:|---:|---|\n")
@@ -641,6 +867,30 @@ def write_markdown(
                 f"{row['found_percent']}% | "
                 f"{'yes' if row.get('has_error') else 'no'} | "
                 f"{', '.join(row['found_tags'])} |\n"
+            )
+        handle.write("\n")
+
+        handle.write("## Best model that do not overtag\n\n")
+        handle.write(
+            "This score measures whether each model found the right tags for this "
+            "report without adding too many wrong or useless tags. Precision is "
+            "`validated tags / proposed tags`, so false or irrelevant tags reduce "
+            "the score. Recall is `consensus tags found / total consensus tags`, "
+            "so missed expected tags reduce the score. F1 is "
+            "`2 * precision * recall / (precision + recall)`, so models rank well "
+            "only when they find the expected tags and avoid unnecessary ones.\n\n"
+        )
+        handle.write(
+            "| model | F1 | precision | recall | validated/proposed | found/consensus | error |\n"
+        )
+        handle.write("|---|---:|---:|---:|---:|---:|---:|\n")
+        for row in data["best_balanced_model"]:
+            handle.write(
+                f"| {row['model']} | {row['balanced_f1_percent']}% | "
+                f"{row['precision_percent']}% | {row['recall_percent']}% | "
+                f"{row['validated_count']}/{row['proposed_count']} | "
+                f"{row['found_count']}/{row['total_most_approved_tags']} | "
+                f"{'yes' if row.get('has_error') else 'no'} |\n"
             )
         handle.write("\n")
 
@@ -678,12 +928,18 @@ def write_markdown(
             )
         handle.write("\n")
 
-        handle.write("## Best models\n\n")
+        handle.write("## Best model for tagging\n\n")
         handle.write(
-            "Per-model precision for this report. This ranks models by the "
-            "percentage of proposed tags confirmed as true. High values mean fewer "
-            "false positives; this is different from `Best model for tagging`, "
-            "which measures recall against consensus tags.\n\n"
+            "This score measures how reliable each model's proposed tags are for "
+            "this report. The score is the percentage of proposed tags that "
+            "validation confirmed as true: `validated tags / proposed tags`. A "
+            "high score means the model avoided false positives and mostly "
+            "proposed tags validators accepted. This is different from `Best model "
+            "for tagging consensus`, which measures whether the model found the "
+            "expected consensus tags. This metric does not care whether a tag is "
+            "part of the consensus: a non-consensus tag is not penalized if "
+            "validation confirms it as true. It is penalized if validation rejects "
+            "it, or if it is not confirmed as true.\n\n"
         )
         handle.write("| model | validated | proposed | percent | error |\n")
         handle.write("|---|---:|---:|---:|---:|\n")

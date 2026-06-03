@@ -89,6 +89,29 @@ def configure_log_level(config: dict[str, Any]) -> None:
     logger.debug("Log level configured: %s", log_level_name)
 
 
+def get_blacklist(config: dict[str, Any]) -> set[str]:
+    """
+    Return configured model blacklist.
+    """
+    ollama_config = config.get("ollama") or {}
+    values: list[Any] = []
+    for key in ("blacklist", "bblacklist"):
+        for item in (config.get(key), ollama_config.get(key)):
+            if isinstance(item, list):
+                values.extend(item)
+            elif item:
+                values.append(item)
+    return {str(model).strip() for model in values if str(model).strip()}
+
+
+def ensure_model_allowed(model_name: str, config: dict[str, Any]) -> None:
+    """
+    Reject blacklisted model use.
+    """
+    if model_name in get_blacklist(config):
+        raise ValueError(f"model is blacklisted: {model_name}")
+
+
 def ollama_request(
     session: requests.Session,
     method: str,
@@ -165,8 +188,11 @@ def list_ollama_models(config: dict[str, Any]) -> list[dict[str, Any]]:
     ollama_config = config.get("ollama") or {}
     api_base = str(ollama_config.get("api_base") or "http://localhost:11434").rstrip("/")
     timeout = int(ollama_config.get("timeout") or 240)
+    blacklist = get_blacklist(config)
 
     logger.info("Connecting to Ollama: %s", api_base)
+    if blacklist:
+        logger.info("Blacklisted models: %s", ", ".join(sorted(blacklist)))
     session = requests.Session()
 
     tags = ollama_request(session, "GET", f"{api_base}/api/tags", timeout)
@@ -178,6 +204,9 @@ def list_ollama_models(config: dict[str, Any]) -> list[dict[str, Any]]:
         name = model.get("name")
         if not name:
             logger.debug("Skipping malformed Ollama model entry: %s", model)
+            continue
+        if name in blacklist:
+            logger.debug("Skipping blacklisted Ollama model: name=%s", name)
             continue
 
         show_data = ollama_request(
@@ -311,6 +340,7 @@ def evaluate_tags(
     model_name = model or str(ollama_config.get("model") or "")
     if not model_name:
         raise ValueError("missing model")
+    ensure_model_allowed(model_name, CONFIG)
 
     if taxo:
         query = TAXONOMY_TAG_EVALUATION_QUERY.format(
@@ -352,6 +382,7 @@ def warmup_model(
     model_name = model or str(ollama_config.get("model") or "")
     if not model_name:
         raise ValueError("missing model")
+    ensure_model_allowed(model_name, CONFIG)
 
     logger.info("Warming up model: %s", model_name)
     session = requests.Session()
@@ -425,6 +456,7 @@ def validate_tags(
     model_name = model or str(ollama_config.get("model") or "")
     if not model_name:
         raise ValueError("missing model")
+    ensure_model_allowed(model_name, CONFIG)
 
     tag_block = "\n".join(f"- {tag}" for tag in tags)
     taxonomy_block = ""

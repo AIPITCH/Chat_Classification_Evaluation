@@ -14,4 +14,13 @@ ollama:
     - glm-ocr:latest
     - laguna-xs.2:bf16
     - qwen3-vl:30b
-    - glm-4.7-flash:bf16 
+    - glm-4.7-flash:bf16
+    - qwen3.5:0.8b
+    - llama4:latest
+    - qwen3.5:2b
+    - qwen3.5:4b
+    - mistral-nemo:12b-instruct-2407-fp16
+    - qwen3.5:9b
+    - qwen2.5vl:latest
+    - nemotron3:33b
+    - qwen3-coder:latest

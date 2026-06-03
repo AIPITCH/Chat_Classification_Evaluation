@@ -165,10 +165,15 @@ def evaluate_model(
     model: str,
     timeout: int,
     taxo: bool = False,
+    taxonomy_entries: list[str] | None = None,
 ) -> str:
     """
     Evaluate one model and return CSV tags.
     """
+    payload: dict[str, Any] = {"sample_channel": sample_channel}
+    if taxo and taxonomy_entries is not None:
+        payload["taxonomy_entries"] = taxonomy_entries
+
     response = requests.post(
         f"{api_base}/evaluate_tags",
         params={
@@ -176,7 +181,7 @@ def evaluate_model(
             "taxo": "true" if taxo else "false",
             "timeout": str(timeout),
         },
-        json={"sample_channel": sample_channel},
+        json=payload,
         timeout=timeout,
     )
     response.raise_for_status()
@@ -237,13 +242,14 @@ def load_taxonomy_tags(path: str) -> dict[str, str]:
     """
     data = load_json(path)
     tags = {}
+    fallback_tags = {}
     for value in data.get("values") or []:
-        if value.get("predicate") not in ALLOWED_TAXONOMY_PREDICATES:
-            continue
         for entry in value.get("entry") or []:
             if entry.get("uuid") and entry.get("value"):
-                tags[entry["uuid"].lower()] = entry["value"]
-    return tags
+                fallback_tags[entry["uuid"].lower()] = entry["value"]
+                if value.get("predicate") in ALLOWED_TAXONOMY_PREDICATES:
+                    tags[entry["uuid"].lower()] = entry["value"]
+    return tags or fallback_tags
 
 
 def load_taxonomy_prompt_entries(path: str) -> list[str]:
@@ -252,17 +258,36 @@ def load_taxonomy_prompt_entries(path: str) -> list[str]:
     """
     data = load_json(path)
     entries = []
+    fallback_entries = []
     for value in data.get("values") or []:
-        if value.get("predicate") not in ALLOWED_TAXONOMY_PREDICATES:
-            continue
         for entry in value.get("entry") or []:
             if entry.get("uuid") and entry.get("value"):
                 description = entry.get("description") or entry.get("expanded") or ""
                 if description:
-                    entries.append(f'{entry["uuid"]}: {entry["value"]}: {description}')
+                    line = f'{entry["uuid"]}: {entry["value"]}: {description}'
                 else:
-                    entries.append(f'{entry["uuid"]}: {entry["value"]}')
-    return sorted(entries, key=str.casefold)
+                    line = f'{entry["uuid"]}: {entry["value"]}'
+                fallback_entries.append(line)
+                if value.get("predicate") in ALLOWED_TAXONOMY_PREDICATES:
+                    entries.append(line)
+    return sorted(entries or fallback_entries, key=str.casefold)
+
+
+def load_taxonomy_definitions(path: str) -> dict[str, str]:
+    """
+    Load taxonomy definitions by tag value.
+    """
+    data = load_json(path)
+    definitions = {}
+    fallback_definitions = {}
+    for value in data.get("values") or []:
+        for entry in value.get("entry") or []:
+            if entry.get("value"):
+                definition = entry.get("description") or entry.get("expanded") or ""
+                fallback_definitions[entry["value"]] = definition
+                if value.get("predicate") in ALLOWED_TAXONOMY_PREDICATES:
+                    definitions[entry["value"]] = definition
+    return definitions or fallback_definitions
 
 
 def json_to_markdown(data: Any, title: str = "sample_channel") -> str:
@@ -591,6 +616,7 @@ def evaluate_channels(
     timeout: int,
     taxo_mode: bool,
     taxonomy_tags: dict[str, str],
+    taxonomy_entries: list[str],
     max_parse_retries: int = 2,
 ) -> None:
     """
@@ -668,6 +694,7 @@ def evaluate_channels(
                             model,
                             timeout,
                             taxo_mode,
+                            taxonomy_entries,
                         )
                         try:
                             if taxo_mode:
@@ -824,6 +851,7 @@ def main() -> int:
     blacklist = get_blacklist(config)
     taxo_mode = not args.freetag
     taxonomy_tags = load_taxonomy_tags(args.taxo_file) if taxo_mode else {}
+    taxonomy_entries = load_taxonomy_prompt_entries(args.taxo_file) if taxo_mode else []
     models = [
         model for model in get_models(api_base, args.timeout) if model not in blacklist
     ]
@@ -887,6 +915,7 @@ def main() -> int:
         args.timeout,
         taxo_mode,
         taxonomy_tags,
+        taxonomy_entries,
         args.parse_retries,
     )
 

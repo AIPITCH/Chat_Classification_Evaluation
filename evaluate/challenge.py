@@ -19,6 +19,7 @@ from evaluate import channel_output_dir, configure_log_level, discover_sample_pa
 from evaluate import get_classifier_api_base, logger
 from evaluate import load_json
 from evaluate import get_ollama_api_base, load_config, load_ollama_model
+from evaluate import load_taxonomy_definitions
 from evaluate import read_existing_results, sample_path_for_id
 from evaluate import set_results_dir
 from evaluate import unload_ollama_model, warmup_model
@@ -67,6 +68,7 @@ def validate_model(
     tags: list[str],
     timeout: int,
     taxo: bool = False,
+    taxonomy_definitions: dict[str, str] | None = None,
     max_invalid_json_retries: int = 3,
 ) -> tuple[dict[str, Any], str]:
     """
@@ -77,6 +79,13 @@ def validate_model(
     last_raw_output = ""
 
     for _ in range(max_invalid_json_retries + 1):
+        payload: dict[str, Any] = {
+            "sample_channel": sample_channel,
+            "tags": tags,
+        }
+        if taxo and taxonomy_definitions is not None:
+            payload["taxonomy_definitions"] = taxonomy_definitions
+
         response = requests.post(
             f"{api_base}/validate_tags",
             params={
@@ -85,10 +94,7 @@ def validate_model(
                 "taxo": "true" if taxo else "false",
                 "timeout": str(timeout),
             },
-            json={
-                "sample_channel": sample_channel,
-                "tags": tags,
-            },
+            json=payload,
             timeout=timeout,
         )
         body = response.text.strip()
@@ -483,6 +489,7 @@ def validate_channels(
     channels: list[dict[str, Any]],
     timeout: int,
     taxo_mode: bool,
+    taxonomy_definitions: dict[str, str],
     retry_model: str | None = None,
     max_parse_retries: int = 2,
 ) -> None:
@@ -514,7 +521,7 @@ def validate_channels(
         return f"[{current}/{total_queries} queries]"
 
     for model in all_models:
-        pending = [
+        eligible = [
             channel
             for channel in channels
             if (
@@ -523,10 +530,25 @@ def validate_channels(
             )
             and model in channel["model_tags"]
             and channel["model_tags"].get(model)
-            and model not in {result[0] for result in channel["results"]}
+        ]
+        pending = [
+            channel
+            for channel in eligible
+            if model not in {result[0] for result in channel["results"]}
         ]
         if not pending:
-            logger.info("%s Skipping %s: already done everywhere", progress(), model)
+            if eligible:
+                logger.info(
+                    "%s Skipping %s: already validated for eligible channel(s)",
+                    progress(),
+                    model,
+                )
+            else:
+                logger.info(
+                    "%s Skipping %s: no non-empty classification tags to validate",
+                    progress(),
+                    model,
+                )
             continue
 
         logger.info("%s Load %s", progress(), model)
@@ -563,6 +585,7 @@ def validate_channels(
                             channel["all_tags"],
                             timeout,
                             taxo_mode,
+                            taxonomy_definitions,
                         )
                         if "error" not in result or attempt >= max_parse_retries:
                             break
@@ -711,6 +734,11 @@ def main() -> int:
         help="Validate free labels instead of MISP dark-web taxonomy tags",
     )
     parser.add_argument(
+        "--taxo-file",
+        default=os.path.join(REPO_DIR, "src", "dark-web-machinetag.json"),
+        help="MISP machinetag.json path",
+    )
+    parser.add_argument(
         "--retry-model",
         default=None,
         help="Flush this model from validation.md and rerun only it",
@@ -741,6 +769,9 @@ def main() -> int:
     api_base = (args.api or get_classifier_api_base(config)).rstrip("/")
     ollama_api_base = get_ollama_api_base(config)
     taxo_mode = not args.freetag
+    taxonomy_definitions = (
+        load_taxonomy_definitions(args.taxo_file) if taxo_mode else {}
+    )
 
     if args.doall and args.do_id:
         logger.error("Use either --do or --doall")
@@ -788,6 +819,7 @@ def main() -> int:
         channels,
         args.timeout,
         taxo_mode,
+        taxonomy_definitions,
         args.retry_model,
         args.parse_retries,
     )

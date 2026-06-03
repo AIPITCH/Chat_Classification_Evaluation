@@ -329,6 +329,7 @@ def evaluate_tags(
     model: str | None = None,
     taxo: bool = False,
     timeout_override: int | None = None,
+    taxonomy_entries: list[str] | None = None,
 ) -> str:
     """
     Ask Ollama to classify a channel sample.
@@ -343,8 +344,11 @@ def evaluate_tags(
     ensure_model_allowed(model_name, CONFIG)
 
     if taxo:
+        entries = (
+            taxonomy_entries if taxonomy_entries is not None else get_taxonomy_tags()
+        )
         query = TAXONOMY_TAG_EVALUATION_QUERY.format(
-            taxonomy_tags="\n".join(f"- {tag}" for tag in get_taxonomy_tags())
+            taxonomy_tags="\n".join(f"- {entry}" for entry in entries)
         )
     else:
         query = TAG_EVALUATION_QUERY
@@ -445,6 +449,7 @@ def validate_tags(
     model: str | None = None,
     taxo: bool = False,
     timeout_override: int | None = None,
+    taxonomy_definitions: dict[str, str] | None = None,
 ) -> str:
     """
     Ask Ollama to justify and validate tags against a channel sample.
@@ -461,7 +466,11 @@ def validate_tags(
     tag_block = "\n".join(f"- {tag}" for tag in tags)
     taxonomy_block = ""
     if taxo:
-        definitions = load_taxonomy_definitions()
+        definitions = (
+            taxonomy_definitions
+            if taxonomy_definitions is not None
+            else load_taxonomy_definitions()
+        )
         taxonomy_lines = [
             f"- {tag}: {definitions.get(tag, '')}".rstrip() for tag in tags
         ]
@@ -542,12 +551,25 @@ def create_app() -> Flask:
             return jsonify({"error": "sample_channel must be object or array"}), 400
         if model is not None and not isinstance(model, str):
             return jsonify({"error": "model must be string"}), 400
+        taxonomy_entries = payload.get("taxonomy_entries")
+        if taxonomy_entries is not None:
+            if not isinstance(taxonomy_entries, list):
+                return jsonify({"error": "taxonomy_entries must be array"}), 400
+            taxonomy_entries = [
+                str(entry).strip() for entry in taxonomy_entries if str(entry).strip()
+            ]
 
         try:
             timeout_override = parse_timeout(
                 payload.get("timeout") or request.args.get("timeout")
             )
-            labels = evaluate_tags(sample_channel, model, taxo, timeout_override)
+            labels = evaluate_tags(
+                sample_channel,
+                model,
+                taxo,
+                timeout_override,
+                taxonomy_entries,
+            )
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
         except requests.RequestException as error:
@@ -591,7 +613,15 @@ def create_app() -> Flask:
             sample_channel = {
                 key: value
                 for key, value in payload.items()
-                if key not in {"model", "tags", "labels", "taxo", "timeout"}
+                if key
+                not in {
+                    "model",
+                    "tags",
+                    "labels",
+                    "taxo",
+                    "timeout",
+                    "taxonomy_definitions",
+                }
             }
         model = payload.get("model") or request.args.get("model")
         taxo = str(payload.get("taxo") or request.args.get("taxo") or "").lower() in {
@@ -612,6 +642,15 @@ def create_app() -> Flask:
             return jsonify({"error": "sample_channel must be object or array"}), 400
         if model is not None and not isinstance(model, str):
             return jsonify({"error": "model must be string"}), 400
+        taxonomy_definitions = payload.get("taxonomy_definitions")
+        if taxonomy_definitions is not None:
+            if not isinstance(taxonomy_definitions, dict):
+                return jsonify({"error": "taxonomy_definitions must be object"}), 400
+            taxonomy_definitions = {
+                str(tag).strip(): str(definition).strip()
+                for tag, definition in taxonomy_definitions.items()
+                if str(tag).strip()
+            }
 
         try:
             timeout_override = parse_timeout(
@@ -624,6 +663,7 @@ def create_app() -> Flask:
                 model,
                 taxo,
                 timeout_override,
+                taxonomy_definitions,
             )
             result = extract_raw_json(raw_output)
         except json.JSONDecodeError as error:

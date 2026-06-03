@@ -809,6 +809,9 @@ def main() -> int:
     )
     parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout")
     args = parser.parse_args()
+    if not args.doall and not args.do_id:
+        parser.print_help()
+        return 1
     set_results_dir(args.folder)
 
     config = load_config(args.config)

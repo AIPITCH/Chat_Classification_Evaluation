@@ -11,6 +11,7 @@ import os
 import sys
 
 import requests
+import tiktoken
 import yaml
 
 from evaluate import configure_log_level, logger, set_results_dir
@@ -19,6 +20,9 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(THIS_DIR)
 EVALUATE_DIR = THIS_DIR
 CONFIG_PATH = os.path.join(REPO_DIR, "config.yaml")
+DEFAULT_MESSAGE_LIMIT = 100
+MAX_MESSAGE_LIMIT = 65000
+TOKEN_ENCODING = "o200k_base"
 
 
 def load_config(path: str = CONFIG_PATH) -> dict:
@@ -36,12 +40,15 @@ def fetch_channel(
     api_base: str,
     channel_id: str,
     timeout: int,
+    limit: int,
     include_message_meta: bool = False,
 ) -> dict:
     """
     Fetch channel JSON from the local channel service.
     """
-    params = {"id": 1, "timestamp": 1} if include_message_meta else None
+    params = {"limit": limit}
+    if include_message_meta:
+        params.update({"id": 1, "timestamp": 1})
     response = requests.get(
         f"{api_base.rstrip('/')}/get_channel/{channel_id}",
         params=params,
@@ -268,14 +275,112 @@ def normalize_channel(
     return normalized
 
 
+def raw_message_count(data: dict) -> int:
+    """
+    Count messages returned by the backend before local filtering.
+    """
+    if isinstance(data, list):
+        return len(data)
+    messages = data.get("messages") or data.get("msgs") or data.get("data") or []
+    return len(messages) if isinstance(messages, list) else 0
+
+
+def fetch_sample(
+    api_base: str,
+    channel_id: str,
+    timeout: int,
+    limit: int,
+    include_message_meta: bool,
+) -> tuple[dict, int]:
+    """
+    Fetch and normalize a channel sample, returning raw backend message count.
+    """
+    raw = fetch_channel(api_base, channel_id, timeout, limit, include_message_meta)
+    return normalize_channel(raw, channel_id, include_message_meta), raw_message_count(raw)
+
+
 def write_sample(path: str, data: dict) -> None:
     """
     Write sample JSON.
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
+        handle.write(content)
+
+
+def count_json_tokens(data: dict, encoding_name: str = TOKEN_ENCODING) -> int:
+    """
+    Count tokens for the full filtered sample JSON written to disk.
+    """
+    content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    encoding = tiktoken.get_encoding(encoding_name)
+    return len(encoding.encode(content))
+
+
+def select_sample_near_token_target(
+    api_base: str,
+    channel_id: str,
+    timeout: int,
+    target_tokens: int,
+    include_message_meta: bool,
+) -> tuple[dict, int, int, int]:
+    """
+    Fetch samples with varying limits and keep token count closest to target.
+    """
+    best: tuple[int, bool, int, int, dict, int] | None = None
+    seen: dict[int, tuple[dict, int, int]] = {}
+
+    def consider(limit: int) -> tuple[dict, int, int]:
+        nonlocal best
+        if limit not in seen:
+            data, raw_count = fetch_sample(
+                api_base,
+                channel_id,
+                timeout,
+                limit,
+                include_message_meta,
+            )
+            tokens = count_json_tokens(data)
+            seen[limit] = (data, raw_count, tokens)
+        data, raw_count, tokens = seen[limit]
+        score = (abs(tokens - target_tokens), tokens > target_tokens, limit)
+        if best is None or score < best[:3]:
+            best = (*score, data, raw_count, tokens)
+        return data, raw_count, tokens
+
+    previous_limit = 1
+    _, raw_count, tokens = consider(previous_limit)
+    if tokens >= target_tokens or raw_count < previous_limit:
+        assert best is not None
+        return best[3], best[4], best[5], best[2]
+
+    current_limit = 2
+    upper_limit = MAX_MESSAGE_LIMIT
+    while True:
+        current_limit = min(current_limit, MAX_MESSAGE_LIMIT)
+        _, raw_count, tokens = consider(current_limit)
+        if (
+            tokens >= target_tokens
+            or raw_count < current_limit
+            or current_limit == MAX_MESSAGE_LIMIT
+        ):
+            upper_limit = current_limit
+            break
+        previous_limit = current_limit
+        current_limit *= 2
+
+    lower_limit = previous_limit
+    while lower_limit + 1 < upper_limit:
+        mid_limit = (lower_limit + upper_limit) // 2
+        _, raw_count, tokens = consider(mid_limit)
+        if tokens < target_tokens and raw_count >= mid_limit:
+            lower_limit = mid_limit
+        else:
+            upper_limit = mid_limit
+
+    assert best is not None
+    return best[3], best[4], best[5], best[2]
 
 
 def main() -> int:
@@ -300,6 +405,19 @@ def main() -> int:
         help="Base folder for per-channel directories, default result/",
     )
     parser.add_argument("--timeout", type=int, default=None, help="HTTP timeout")
+    limit_group = parser.add_mutually_exclusive_group()
+    limit_group.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Fetch this many messages per channel",
+    )
+    limit_group.add_argument(
+        "--token",
+        type=int,
+        default=None,
+        help="Fetch the message count closest to this full-JSON token budget",
+    )
     parser.add_argument(
         "--random",
         type=int,
@@ -332,6 +450,15 @@ def main() -> int:
     if args.random is not None and args.random < 1:
         logger.error("--random must be >= 1")
         return 1
+    if args.limit is not None and args.limit < 1:
+        logger.error("--limit must be >= 1")
+        return 1
+    if args.limit is not None and args.limit > MAX_MESSAGE_LIMIT:
+        logger.error("--limit must be <= %s", MAX_MESSAGE_LIMIT)
+        return 1
+    if args.token is not None and args.token < 1:
+        logger.error("--token must be >= 1")
+        return 1
 
     try:
         if args.random is not None:
@@ -347,11 +474,26 @@ def main() -> int:
     for index, channel_id in enumerate(channel_ids, 1):
         logger.info("[%s/%s channels] Fetch %s", index, total, channel_id)
         try:
-            data = normalize_channel(
-                fetch_channel(api_base, channel_id, timeout, args.with_message_meta),
-                channel_id,
-                args.with_message_meta,
-            )
+            if args.token is None:
+                selected_limit = args.limit or DEFAULT_MESSAGE_LIMIT
+                data, raw_count = fetch_sample(
+                    api_base,
+                    channel_id,
+                    timeout,
+                    selected_limit,
+                    args.with_message_meta,
+                )
+                tokens = count_json_tokens(data)
+            else:
+                data, raw_count, tokens, selected_limit = (
+                    select_sample_near_token_target(
+                        api_base,
+                        channel_id,
+                        timeout,
+                        args.token,
+                        args.with_message_meta,
+                    )
+                )
         except (requests.RequestException, ValueError, json.JSONDecodeError) as error:
             logger.error("[%s/%s channels] %s: %s", index, total, channel_id, error)
             continue
@@ -359,7 +501,18 @@ def main() -> int:
         path = output_path(channel_id)
         write_sample(path, data)
         written += 1
-        logger.info("[%s/%s channels] Wrote %s", index, total, path)
+        logger.info(
+            "[%s/%s channels] Wrote %s "
+            "(limit %s, %s/%s messages kept, %s filtered-json tokens %s)",
+            index,
+            total,
+            path,
+            selected_limit,
+            len(data.get("messages") or []),
+            raw_count,
+            tokens,
+            TOKEN_ENCODING,
+        )
 
     if written == 0:
         logger.error("No sample written")

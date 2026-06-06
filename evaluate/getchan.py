@@ -22,6 +22,8 @@ EVALUATE_DIR = THIS_DIR
 CONFIG_PATH = os.path.join(REPO_DIR, "config.yaml")
 DEFAULT_MESSAGE_LIMIT = 100
 MAX_MESSAGE_LIMIT = 65000
+MIN_TOKEN_TARGET_RATIO = 0.9
+RANDOM_TOKEN_ATTEMPT_FACTOR = 5
 TOKEN_ENCODING = "o200k_base"
 
 
@@ -324,15 +326,16 @@ def select_sample_near_token_target(
     timeout: int,
     target_tokens: int,
     include_message_meta: bool,
-) -> tuple[dict, int, int, int]:
+) -> tuple[dict, int, int, int, bool]:
     """
     Fetch samples with varying limits and keep token count closest to target.
     """
     best: tuple[int, bool, int, int, dict, int] | None = None
     seen: dict[int, tuple[dict, int, int]] = {}
+    exhausted = False
 
     def consider(limit: int) -> tuple[dict, int, int]:
-        nonlocal best
+        nonlocal best, exhausted
         if limit not in seen:
             data, raw_count = fetch_sample(
                 api_base,
@@ -343,6 +346,8 @@ def select_sample_near_token_target(
             )
             tokens = count_json_tokens(data)
             seen[limit] = (data, raw_count, tokens)
+            if raw_count < limit:
+                exhausted = True
         data, raw_count, tokens = seen[limit]
         score = (abs(tokens - target_tokens), tokens > target_tokens, limit)
         if best is None or score < best[:3]:
@@ -353,7 +358,7 @@ def select_sample_near_token_target(
     _, raw_count, tokens = consider(previous_limit)
     if tokens >= target_tokens or raw_count < previous_limit:
         assert best is not None
-        return best[3], best[4], best[5], best[2]
+        return best[3], best[4], best[5], best[2], exhausted
 
     current_limit = 2
     upper_limit = MAX_MESSAGE_LIMIT
@@ -380,7 +385,14 @@ def select_sample_near_token_target(
             upper_limit = mid_limit
 
     assert best is not None
-    return best[3], best[4], best[5], best[2]
+    return best[3], best[4], best[5], best[2], exhausted
+
+
+def token_target_too_low(tokens: int, target_tokens: int, exhausted: bool) -> bool:
+    """
+    Return whether channel is too short for requested token target.
+    """
+    return exhausted and tokens < int(target_tokens * MIN_TOKEN_TARGET_RATIO)
 
 
 def main() -> int:
@@ -460,19 +472,35 @@ def main() -> int:
         logger.error("--token must be >= 1")
         return 1
 
+    written = 0
+    attempts = 0
+    channel_ids: list[str] = []
+    requested_total = args.random or 1
+    max_attempts = (
+        requested_total * RANDOM_TOKEN_ATTEMPT_FACTOR
+        if args.random is not None and args.token is not None
+        else requested_total
+    )
+
     try:
         if args.random is not None:
-            channel_ids = fetch_random_chats(api_base, args.random, timeout)
+            channel_ids.extend(fetch_random_chats(api_base, requested_total, timeout))
         else:
             channel_ids = [args.channel_id]
     except (requests.RequestException, ValueError, json.JSONDecodeError) as error:
         logger.error("%s", error)
         return 1
 
-    written = 0
-    total = len(channel_ids)
-    for index, channel_id in enumerate(channel_ids, 1):
-        logger.info("[%s/%s channels] Fetch %s", index, total, channel_id)
+    while channel_ids and written < requested_total and attempts < max_attempts:
+        attempts += 1
+        channel_id = channel_ids.pop(0)
+        logger.info(
+            "[%s attempts, %s/%s written] Fetch %s",
+            attempts,
+            written,
+            requested_total,
+            channel_id,
+        )
         try:
             if args.token is None:
                 selected_limit = args.limit or DEFAULT_MESSAGE_LIMIT
@@ -484,8 +512,9 @@ def main() -> int:
                     args.with_message_meta,
                 )
                 tokens = count_json_tokens(data)
+                exhausted = raw_count < selected_limit
             else:
-                data, raw_count, tokens, selected_limit = (
+                data, raw_count, tokens, selected_limit, exhausted = (
                     select_sample_near_token_target(
                         api_base,
                         channel_id,
@@ -495,17 +524,46 @@ def main() -> int:
                     )
                 )
         except (requests.RequestException, ValueError, json.JSONDecodeError) as error:
-            logger.error("[%s/%s channels] %s: %s", index, total, channel_id, error)
+            logger.error("[%s attempts] %s: %s", attempts, channel_id, error)
+            continue
+
+        if args.token is not None and token_target_too_low(
+            tokens,
+            args.token,
+            exhausted,
+        ):
+            logger.warning(
+                "[%s attempts, %s/%s written] Skip %s "
+                "(too short: %s tokens < 90%% of %s, %s/%s messages kept)",
+                attempts,
+                written,
+                requested_total,
+                channel_id,
+                tokens,
+                args.token,
+                len(data.get("messages") or []),
+                raw_count,
+            )
+            if args.random is not None and attempts < max_attempts:
+                try:
+                    channel_ids.extend(fetch_random_chats(api_base, 1, timeout))
+                except (
+                    requests.RequestException,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as error:
+                    logger.error("random channel lookup failed: %s", error)
             continue
 
         path = output_path(channel_id)
         write_sample(path, data)
         written += 1
         logger.info(
-            "[%s/%s channels] Wrote %s "
+            "[%s attempts, %s/%s written] Wrote %s "
             "(limit %s, %s/%s messages kept, %s filtered-json tokens %s)",
-            index,
-            total,
+            attempts,
+            written,
+            requested_total,
             path,
             selected_limit,
             len(data.get("messages") or []),
@@ -516,6 +574,14 @@ def main() -> int:
 
     if written == 0:
         logger.error("No sample written")
+        return 1
+    if written < requested_total:
+        logger.error(
+            "Only wrote %s/%s samples after %s attempts",
+            written,
+            requested_total,
+            attempts,
+        )
         return 1
     return 0
 
